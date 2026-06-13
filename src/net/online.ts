@@ -233,33 +233,52 @@ export class ClientWorld implements IWorld {
     const prevSelf = this.entities.get(this.playerId);
     const prevSelfFacing = prevSelf?.facing;
 
-    const applyWire = (w: any): Entity => {
+    const applyWire = (w: any): Entity | null => {
       let e = this.entities.get(w.id);
+      // identity fields ride only in "full" records: first sight and changes
+      const hasIdentity = w.k !== undefined;
       if (!e) {
+        // a lite record for an entity we never met would render as a
+        // half-initialized ghost; skip it (the server sends identity first)
+        if (!hasIdentity) return null;
         e = blankEntity(w.id);
-        e.kind = w.k;
-        e.templateId = w.tid;
-        e.name = w.nm;
-        e.scale = w.sc ?? 1;
-        e.color = w.c ?? 0xffffff;
         e.pos = { x: w.x, y: w.y, z: w.z };
         e.prevPos = { x: w.x, y: w.y, z: w.z };
         e.facing = w.f;
         e.prevFacing = w.f;
+        this.entities.set(w.id, e);
+      }
+      if (hasIdentity) {
+        e.kind = w.k;
+        e.templateId = w.tid;
+        e.name = w.nm;
+        e.level = w.lv;
+        e.scale = w.sc ?? 1;
+        e.color = w.c ?? 0xffffff;
         e.dungeonId = w.dgn ?? null;
         if (e.kind === 'npc') {
           const def = NPCS[e.templateId];
           e.questIds = def ? [...def.questIds] : [];
           e.vendorItems = def?.vendorItems ? [...def.vendorItems] : [];
         }
-        this.entities.set(w.id, e);
       }
+      // per-entity update clock: distant entities are sent below snapshot
+      // rate, so each one interpolates over its own measured cadence. Only
+      // gaps within the slowest legitimate cadence count — records also
+      // pause while an entity's state is unchanged, and folding an idle
+      // period into the estimate would smear its next steps in slow motion
+      if (e.netUpdatedAt !== undefined) {
+        const gap = now - e.netUpdatedAt;
+        if (gap > 5 && gap < 450) {
+          e.netInterval = e.netInterval === undefined ? gap : e.netInterval * 0.7 + gap * 0.3;
+        }
+      }
+      e.netUpdatedAt = now;
       // interpolation bases
       e.prevPos = { ...e.pos };
       e.prevFacing = e.facing;
       e.pos.x = w.x; e.pos.y = w.y; e.pos.z = w.z;
       e.facing = w.f;
-      e.level = w.lv;
       e.hp = w.hp;
       e.maxHp = w.mhp;
       e.dead = !!w.dead;
@@ -281,15 +300,19 @@ export class ClientWorld implements IWorld {
     };
 
     for (const w of snap.ents) {
-      seen.add(w.id);
-      applyWire(w);
+      if (applyWire(w) !== null) seen.add(w.id);
+    }
+    // entities listed in keep are alive but unchanged (or not due an update
+    // at their distance tier this snapshot) — just protect them from pruning
+    for (const id of snap.keep ?? []) {
+      seen.add(id);
     }
 
-    // self with extended state
+    // self with extended state (always a full record)
     const s = snap.self;
-    if (s) {
+    const e = s ? applyWire(s) : null;
+    if (s && e) {
       seen.add(s.id);
-      const e = applyWire(s);
       e.resource = s.res;
       e.maxResource = s.mres;
       e.resourceType = s.rtype;
